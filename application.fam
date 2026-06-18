@@ -14,8 +14,12 @@ App(
             sources=["minmea.c"],
             cdefines=["timegm=mktime"],
         ),
+        Lib(
+            name="ubox",
+            sources=["ubox.c", "ubox_rx.c"],
+        ),
     ],
     fap_author="@ezod & @xMasterX",
     fap_version="1.5",
-    fap_description="Works with GPS modules via UART, using NMEA protocol.",
+    fap_description="Works with GPS modules via UART, auto-detecting NMEA and u-blox UBX protocols.",
 )

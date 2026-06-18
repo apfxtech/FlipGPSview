@@ -43,6 +43,55 @@ static void gps_uart_usb_deinit(GpsUart* gps_uart) {
     gps_uart->cli_vcp = NULL;
 }
 
+// u-blox reports ground speed in mm/s; the UI keeps speed in knots
+#define UBX_MMPS_TO_KNOTS 0.001943844f
+
+// Update the shared GPS status from a decoded UBX NAV-PVT message
+static void gps_uart_apply_nav_pvt(GpsUart* gps_uart) {
+    const Ublox_NAV_PVT_Message* pvt = &gps_uart->ubox_rx.nav_pvt;
+
+    gps_uart->status.valid = (pvt->flags & 0x01) != 0; // gnssFixOK
+    gps_uart->status.latitude = pvt->lat * 1e-7f;
+    gps_uart->status.longitude = pvt->lon * 1e-7f;
+    gps_uart->status.altitude = pvt->hMSL / 1000.0f;
+    gps_uart->status.altitude_units = 'M';
+    gps_uart->status.speed = pvt->gSpeed * UBX_MMPS_TO_KNOTS;
+    gps_uart->status.course = pvt->headMot * 1e-5f;
+    gps_uart->status.fix_quality = pvt->fixType;
+    gps_uart->status.satellites_tracked = pvt->numSV;
+    gps_uart->status.time_hours = pvt->hour;
+    gps_uart->status.time_minutes = pvt->min;
+    gps_uart->status.time_seconds = pvt->sec;
+}
+
+// Update only the time fields from a decoded UBX NAV-TIMEUTC message
+static void gps_uart_apply_nav_timeutc(GpsUart* gps_uart) {
+    const Ublox_NAV_TIMEUTC_Message* t = &gps_uart->ubox_rx.nav_timeutc;
+    gps_uart->status.time_hours = t->hour;
+    gps_uart->status.time_minutes = t->min;
+    gps_uart->status.time_seconds = t->sec;
+}
+
+// Feed a raw byte segment to the UBX parser. UBX frames are framed by the
+// 0xB5 0x62 sync pair and a checksum, so the parser only emits messages for
+// genuine UBX traffic and silently ignores ASCII NMEA bytes. This lets both
+// protocols share the same stream and be auto-detected.
+static void gps_uart_feed_ubx(GpsUart* gps_uart, const uint8_t* data, size_t length) {
+    UboxRxUpdateResult result = ubox_rx_update(&gps_uart->ubox_rx, data, length);
+
+    if(result & UBOX_RX_UPDATE_NAV_PVT) {
+        gps_uart_apply_nav_pvt(gps_uart);
+    }
+    if(result & UBOX_RX_UPDATE_NAV_TIMEUTC) {
+        gps_uart_apply_nav_timeutc(gps_uart);
+    }
+
+    if(result & (UBOX_RX_UPDATE_NAV_PVT | UBOX_RX_UPDATE_NAV_TIMEUTC)) {
+        gps_uart->protocol = GPS_PROTOCOL_UBX;
+        notification_message_block(gps_uart->notifications, &sequence_blink_blue_10);
+    }
+}
+
 static void gps_uart_parse_nmea(GpsUart* gps_uart, char* line) {
     switch(minmea_sentence_id(line, false)) {
     case MINMEA_SENTENCE_RMC: {
@@ -57,6 +106,7 @@ static void gps_uart_parse_nmea(GpsUart* gps_uart, char* line) {
             gps_uart->status.time_minutes = frame.time.minutes;
             gps_uart->status.time_seconds = frame.time.seconds;
 
+            gps_uart->protocol = GPS_PROTOCOL_NMEA;
             notification_message_block(gps_uart->notifications, &sequence_blink_green_10);
         }
     } break;
@@ -74,6 +124,7 @@ static void gps_uart_parse_nmea(GpsUart* gps_uart, char* line) {
             gps_uart->status.time_minutes = frame.time.minutes;
             gps_uart->status.time_seconds = frame.time.seconds;
 
+            gps_uart->protocol = GPS_PROTOCOL_NMEA;
             notification_message_block(gps_uart->notifications, &sequence_blink_magenta_10);
         }
     } break;
@@ -87,6 +138,7 @@ static void gps_uart_parse_nmea(GpsUart* gps_uart, char* line) {
             gps_uart->status.time_minutes = frame.time.minutes;
             gps_uart->status.time_seconds = frame.time.seconds;
 
+            gps_uart->protocol = GPS_PROTOCOL_NMEA;
             notification_message_block(gps_uart->notifications, &sequence_blink_red_10);
         }
     } break;
@@ -121,6 +173,10 @@ static int32_t gps_uart_worker(void* context) {
                     gps_uart->rx_buf + rx_offset,
                     (uint16_t)(RX_BUF_SIZE - 1 - rx_offset));
                 if(len > 0) {
+                    // feed the freshly received bytes to the UBX binary parser before the
+                    // NMEA line logic mangles them; non-UBX bytes are harmlessly ignored
+                    gps_uart_feed_ubx(gps_uart, gps_uart->rx_buf + rx_offset, (size_t)len);
+
                     // increase rx_offset by the number of bytes received, and null-terminate rx_buf
                     rx_offset += len;
                     gps_uart->rx_buf[rx_offset] = '\0';
@@ -162,6 +218,13 @@ static int32_t gps_uart_worker(void* context) {
                             break; // go back to receiving bytes from the serial stream
                         }
                     }
+
+                    // A pure UBX (binary) stream carries no newlines, so the NMEA line
+                    // buffer would otherwise grow without bound. The UBX parser has
+                    // already consumed these bytes, so drop the leftovers to make room.
+                    if(rx_offset >= RX_BUF_SIZE - 1) {
+                        rx_offset = 0;
+                    }
                 }
             } while(len > 0);
         }
@@ -185,6 +248,9 @@ void gps_uart_init_thread(GpsUart* gps_uart) {
     gps_uart->status.time_minutes = 0;
     gps_uart->status.time_seconds = 0;
 
+    gps_uart->protocol = GPS_PROTOCOL_NONE;
+    ubox_rx_init(&gps_uart->ubox_rx);
+
     gps_uart->thread = furi_thread_alloc();
     furi_thread_set_name(gps_uart->thread, "GpsUartWorker");
     furi_thread_set_stack_size(gps_uart->thread, 1024);
@@ -206,6 +272,8 @@ void gps_uart_deinit_thread(GpsUart* gps_uart) {
     furi_thread_flags_set(furi_thread_get_id(gps_uart->thread), WorkerEvtStop);
     furi_thread_join(gps_uart->thread);
     furi_thread_free(gps_uart->thread);
+
+    ubox_rx_free(&gps_uart->ubox_rx);
 }
 
 GpsUart* gps_uart_enable() {

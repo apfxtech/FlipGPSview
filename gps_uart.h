@@ -5,6 +5,8 @@
 #include <cli/cli_vcp.h>
 #include <notification/notification_messages.h>
 
+#include <ubox_rx.h>
+
 // Virtual COM port channel used to receive NMEA data over USB
 #define GPS_VCP_CH 0
 
@@ -30,6 +32,13 @@ typedef struct {
 
 typedef enum { KNOTS, KPH, MPH, INVALID } SpeedUnit;
 
+// Wire protocol detected on the incoming byte stream
+typedef enum {
+    GPS_PROTOCOL_NONE,
+    GPS_PROTOCOL_NMEA,
+    GPS_PROTOCOL_UBX,
+} GpsProtocol;
+
 typedef enum {
     CHANGE_BAUDRATE,
     CHANGE_BACKLIGHT,
@@ -52,6 +61,9 @@ typedef struct {
 
     CliVcp* cli_vcp;
     FuriHalUsbInterface* usb_if_prev;
+
+    UboxRx ubox_rx;
+    GpsProtocol protocol;
 
     GpsStatus status;
 } GpsUart;
